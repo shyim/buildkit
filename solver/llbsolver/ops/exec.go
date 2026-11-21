@@ -389,7 +389,7 @@ func (e *ExecOp) Exec(ctx context.Context, jobCtx solver.JobContext, inputs []so
 		platformOS = e.platform.OS
 	}
 	g := jobCtx.Session()
-	p, err := container.PrepareMounts(ctx, e.mm, e.cm, g, e.op.Meta.Cwd, e.op.Mounts, refs, func(m *pb.Mount, ref cache.ImmutableRef) (cache.MutableRef, error) {
+	p, err := container.PrepareMounts(mounts.WithCacheMountHooks(ctx, cacheMountHooks(ctx, jobCtx)), e.mm, e.cm, g, e.op.Meta.Cwd, e.op.Mounts, refs, func(m *pb.Mount, ref cache.ImmutableRef) (cache.MutableRef, error) {
 		desc := fmt.Sprintf("mount %s from exec %s", m.Dest, strings.Join(e.op.Meta.Args, " "))
 		return e.cm.New(ctx, ref, g, cache.WithDescription(desc))
 	}, platformOS)
@@ -643,4 +643,23 @@ func (e *ExecOp) ProxyCapture() *network.ProxyCapture {
 
 func (e *ExecOp) ProxyNetwork() bool {
 	return e.proxyNetwork
+}
+
+// cacheMountHooks returns the cache mount hooks of every job that shares this
+// exec.
+func cacheMountHooks(ctx context.Context, jobCtx solver.JobContext) []mounts.CacheMountHook {
+	ev, ok := jobCtx.(interface {
+		EachValue(ctx context.Context, key string, fn func(any) error) error
+	})
+	if !ok {
+		return nil
+	}
+	var hooks []mounts.CacheMountHook
+	_ = ev.EachValue(ctx, mounts.JobKeyCacheMountHook, func(v any) error {
+		if h, ok := v.(mounts.CacheMountHook); ok {
+			hooks = append(hooks, h)
+		}
+		return nil
+	})
+	return hooks
 }

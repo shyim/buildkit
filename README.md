@@ -597,6 +597,9 @@ in your workflow to expose the runtime.
 * `scope=<scope>`: which scope cache object belongs to (default `buildkit`)
 * `ignore-error=<false|true>`: specify if error is ignored in case cache export fails (default: `false`)
 * `timeout=<duration>`: sets the timeout duration for cache export (default: `10m`)
+* `mounts=<false|true|only>`: export the contents of the cache mounts (`RUN --mount=type=cache`) used by the build (default: `false`)
+  * `true`: export cache mounts along with the layer cache
+  * `only`: export only cache mounts, without the layer cache
 
 The [common compression options](#export-cache) also apply to `type=gha` exports.
 
@@ -604,6 +607,47 @@ The [common compression options](#export-cache) also apply to `type=gha` exports
 * `type=gha`
 * `scope=<scope>`: which scope cache object belongs to (default `buildkit`)
 * `timeout=<duration>`: sets the timeout duration for cache import (default: `10m`)
+* `mounts=<false|true|only>`: seed cache mounts that do not exist on the builder from the exported cache mounts (default: `false`)
+  * `true`: import cache mounts along with the layer cache
+  * `only`: import only cache mounts, without the layer cache
+
+##### Cache mounts
+
+With `mounts=true`, the contents of every cache mount used by the build are
+exported along with the build cache, and imported on a builder that does not
+have them yet:
+
+```bash
+buildctl build ... \
+  --export-cache type=gha,mode=max,mounts=true \
+  --import-cache type=gha,mounts=true
+```
+
+* Each cache mount is stored as a single layer holding its full contents,
+  under its cache ID. Mounts with unchanged contents are not uploaded again.
+* A cache mount that already exists on the builder is always used as is; the
+  exported one is only used to create a missing cache mount.
+* Exporting keeps the stored contents of cache mounts that the build did not
+  use, such as mounts of steps that were cached.
+* Cache mounts with a `from` source, and cache mounts still in use by another
+  build when the export runs, are not exported.
+* Cache mount contents count against the cache size limit. Large caches, such
+  as package manager caches, can lead to frequent evictions.
+* Not supported together with cache signing.
+
+To use cache mounts without layer caching, set `mounts=only`. The layer
+cache is then neither exported nor imported, and an export leaves the layer
+cache already stored in the scope untouched:
+
+```bash
+buildctl build ... \
+  --export-cache type=gha,mounts=only \
+  --import-cache type=gha,mounts=only
+```
+
+Cache mounts and the layer cache are stored separately, so both can also be
+configured independently with two entries, for example
+`--export-cache type=gha,mode=max --export-cache type=gha,mounts=only`.
 
 #### S3 cache (experimental)
 

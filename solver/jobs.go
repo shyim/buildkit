@@ -418,12 +418,18 @@ func (sb *subBuilder) InContext(ctx context.Context, f func(context.Context, Job
 }
 
 func (sb *subBuilder) EachValue(ctx context.Context, key string, fn func(any) error) error {
-	sb.state.mu.RLock()
-	jobs := make([]*Job, 0, len(sb.jobs))
-	for j := range sb.jobs {
+	return sb.state.EachValue(ctx, key, fn)
+}
+
+// EachValue calls fn for the value stored under key in every job that
+// shares this vertex.
+func (s *state) EachValue(ctx context.Context, key string, fn func(any) error) error {
+	s.mu.RLock()
+	jobs := make([]*Job, 0, len(s.jobs))
+	for j := range s.jobs {
 		jobs = append(jobs, j)
 	}
-	sb.state.mu.RUnlock()
+	s.mu.RUnlock()
 
 	for _, j := range jobs {
 		if err := j.EachValue(ctx, key, fn); err != nil {

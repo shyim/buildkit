@@ -859,6 +859,17 @@ func (c *Controller) resolveCacheExporters(ctx context.Context, g session.Group,
 			bklog.G(ctx).Debugf("cache exporter resolver for %v returned nil, skipping exporter", e.Type)
 			continue
 		}
+		mounts, err := remotecache.ParseMountsAttr(e.Attrs)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to configure %v cache exporter", e.Type)
+		}
+		if mounts.Mounts() {
+			if _, ok := exp.Exporter.(remotecache.MountCacheExporter); !ok {
+				return nil, errors.Errorf("%v cache exporter does not support exporting cache mounts", e.Type)
+			}
+		}
+		exp.ExportMounts = mounts.Mounts()
+		exp.SkipLayers = !mounts.Layers()
 		if exportMode, supported := parseCacheExportMode(e.Attrs["mode"]); !supported {
 			bklog.G(ctx).Debugf("skipping invalid cache export mode: %s", e.Attrs["mode"])
 		} else {

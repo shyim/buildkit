@@ -926,9 +926,12 @@ is needed.
 > included in [exported build cache](https://docs.docker.com/build/cache/backends/)
 > (`--cache-to`), and are not restored by `--cache-from`. If each build runs
 > on a new builder (e.g. on CI runners that provision a fresh machine
-> for each job), cache mounts start empty on every build. For a workaround on
-> GitHub Actions, see
-> [Cache mounts](https://docs.docker.com/build/ci/github-actions/cache/#cache-mounts).
+> for each job), cache mounts start empty on every build. The GitHub Actions
+> cache backend can export and import cache mounts with the `mounts=true`
+> option (`--cache-to type=gha,mounts=true` and
+> `--cache-from type=gha,mounts=true`), or `mounts=only` to use them without
+> layer caching. For a workaround on other backends,
+> see [Cache mounts](https://docs.docker.com/build/ci/github-actions/cache/#cache-mounts).
 
 #### Example: cache Go packages
 

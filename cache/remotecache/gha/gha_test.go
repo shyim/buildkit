@@ -16,6 +16,7 @@ import (
 	"time"
 
 	signingconfig "github.com/moby/buildkit/cache/remotecache/signing/config"
+	cacheimporttypes "github.com/moby/buildkit/cache/remotecache/v1/types"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/util/testutil/integration"
@@ -356,5 +357,188 @@ func TestLoadScopeSignature(t *testing.T) {
 				require.Zero(t, signatureLookups.Load())
 			}
 		})
+	}
+}
+
+func TestGhaCacheMountsIntegration(t *testing.T) {
+	integration.Run(t,
+		integration.TestFuncs(testGhaCacheMountsImportExport),
+		integration.WithMirroredImages(integration.OfficialImages("busybox:latest")),
+	)
+}
+
+func testGhaCacheMountsImportExport(t *testing.T, sb integration.Sandbox) {
+	requiresLinux(t)
+	workers.CheckFeatureCompat(t, sb,
+		workers.FeatureCacheExport,
+		workers.FeatureCacheImport,
+		workers.FeatureCacheBackendGha,
+	)
+
+	c, err := client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	cacheAttrs := ghaCacheAttrs(t)
+	scope := "buildkit-" + t.Name() + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+
+	busybox := llb.Image("busybox:latest")
+	solve := func(cmd string, cacheExports, cacheImports []client.CacheOptionsEntry) string {
+		st := busybox.Run(
+			llb.Shlex(`sh -c "`+cmd+`"`),
+			llb.AddMount("/cache", llb.Scratch(), llb.AsPersistentCacheDir("gha-mounts-test", llb.CacheMountShared)),
+			llb.Dir("/wd"),
+		).AddMount("/wd", llb.Scratch())
+		def, err := st.Marshal(sb.Context())
+		require.NoError(t, err)
+		destDir := t.TempDir()
+		_, err = c.Solve(sb.Context(), def, client.SolveOpt{
+			Exports: []client.ExportEntry{{
+				Type:      client.ExporterLocal,
+				OutputDir: destDir,
+			}},
+			CacheExports: cacheExports,
+			CacheImports: cacheImports,
+		}, nil)
+		require.NoError(t, err)
+		dt, err := os.ReadFile(filepath.Join(destDir, "out"))
+		require.NoError(t, err)
+		return string(dt)
+	}
+
+	attrs := map[string]string{"scope": scope, "mounts": "true"}
+	maps.Copy(attrs, cacheAttrs)
+
+	// Fill the cache mount with random data and export it.
+	written := solve(`head -c 32 /dev/urandom | sha256sum > /cache/data && cp /cache/data out`,
+		[]client.CacheOptionsEntry{{Type: "gha", Attrs: attrs}}, nil)
+
+	ensurePruneAll(t, c, sb)
+	// Github Cache Service v2 is not immediately consistent.
+	time.Sleep(3 * time.Second)
+
+	// A different command misses the layer cache, so it can only see the
+	// data if the cache mount was imported.
+	read := solve(`cp /cache/data out`, nil, []client.CacheOptionsEntry{{Type: "gha", Attrs: attrs}})
+	require.Equal(t, written, read)
+}
+
+func ghaCacheAttrs(t *testing.T) map[string]string {
+	t.Helper()
+	cacheAttrs := map[string]string{}
+	if v, ok := os.LookupEnv("ACTIONS_CACHE_SERVICE_V2"); ok {
+		if b, err := strconv.ParseBool(v); err == nil && b {
+			cacheAttrs["url_v2"] = os.Getenv("ACTIONS_RESULTS_URL")
+		}
+	}
+	cacheAttrs["url"] = os.Getenv("ACTIONS_CACHE_URL")
+	if cacheAttrs["url"] == "" {
+		cacheAttrs["url"] = os.Getenv("ACTIONS_RESULTS_URL")
+	}
+	cacheAttrs["token"] = os.Getenv("ACTIONS_RUNTIME_TOKEN")
+	if cacheAttrs["token"] == "" || (cacheAttrs["url"] == "" && cacheAttrs["url_v2"] == "") {
+		t.Skip("actions runtime token and cache url must be set")
+	}
+	return cacheAttrs
+}
+
+func TestResolveCacheMountsScopePrecedence(t *testing.T) {
+	indexFor := func(dgst digest.Digest) []byte {
+		dt, err := json.Marshal(mountIndex{Mounts: map[string]cacheimporttypes.CacheLayer{
+			"shared": {Blob: dgst, Annotations: &cacheimporttypes.LayerAnnotations{
+				MediaType: "application/vnd.oci.image.layer.v1.tar+gzip",
+				DiffID:    digest.FromString("diff-" + dgst.String()),
+				Size:      1,
+			}},
+		}})
+		require.NoError(t, err)
+		return dt
+	}
+	mainBlob := digest.FromString("main")
+	branchBlob := digest.FromString("branch")
+	mainIndex := indexFor(mainBlob)
+	var branchIndex []byte
+	{
+		var idx mountIndex
+		require.NoError(t, json.Unmarshal(indexFor(branchBlob), &idx))
+		idx.Mounts["branch-only"] = idx.Mounts["shared"]
+		dt, err := json.Marshal(idx)
+		require.NoError(t, err)
+		branchIndex = dt
+	}
+
+	// The read-only default branch scope is listed first; the writable
+	// branch scope must still win.
+	claims, err := json.Marshal(map[string]any{
+		"ac":  `[{"Scope":"refs/heads/main","Permission":1},{"Scope":"refs/heads/feature","Permission":3}]`,
+		"nbf": time.Now().Add(-time.Minute).Unix(),
+		"exp": time.Now().Add(time.Hour).Unix(),
+	})
+	require.NoError(t, err)
+	token := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`)) + "." + base64.RawURLEncoding.EncodeToString(claims) + "."
+	cfg, err := getConfig(nil, nil, map[string]string{
+		attrToken:      token,
+		attrURL:        "https://cache.example",
+		attrAPIVersion: "1",
+	})
+	require.NoError(t, err)
+
+	keys := map[string][]byte{
+		mountIndexKey("refs/heads/main", cfg):    mainIndex,
+		mountIndexKey("refs/heads/feature", cfg): branchIndex,
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/_apis/artifactcache/cache":
+			key := r.URL.Query().Get("keys")
+			if _, ok := keys[key]; !ok {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]string{
+				"cacheKey":        key,
+				"archiveLocation": "http://" + r.Host + "/blob/" + key,
+			}))
+		case strings.HasPrefix(r.URL.Path, "/blob/"):
+			_, _ = w.Write(keys[strings.TrimPrefix(r.URL.Path, "/blob/")])
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	cfg.URL = server.URL
+
+	ci, err := NewImporter(cfg)
+	require.NoError(t, err)
+	remotes, err := ci.(*importer).ResolveCacheMounts(t.Context())
+	require.NoError(t, err)
+	require.Len(t, remotes, 2)
+	require.Equal(t, branchBlob, remotes["shared"].Descriptors[0].Digest)
+	require.Equal(t, branchBlob, remotes["branch-only"].Descriptors[0].Digest)
+	require.Equal(t, digest.FromString("diff-"+branchBlob.String()).String(),
+		remotes["shared"].Descriptors[0].Annotations["containerd.io/uncompressed"])
+}
+
+func TestCacheMountsRejectSignedCache(t *testing.T) {
+	cfg, err := getConfig(&signingconfig.Config{
+		Verify: signingconfig.VerifyConfig{Required: true},
+	}, nil, map[string]string{
+		attrToken: "unused",
+		attrURL:   "https://cache.example",
+	})
+	require.NoError(t, err)
+	require.ErrorContains(t, checkMountsSupported(cfg), "not supported with signed")
+}
+
+func TestGetConfigMountsOnly(t *testing.T) {
+	for mounts, skip := range map[string]bool{"": false, "false": false, "true": false, "only": true} {
+		cfg, err := getConfig(nil, nil, map[string]string{
+			attrToken: "unused",
+			attrURL:   "https://cache.example",
+			"mounts":  mounts,
+		})
+		require.NoError(t, err)
+		require.Equal(t, skip, cfg.SkipLayers, "mounts=%q", mounts)
 	}
 }

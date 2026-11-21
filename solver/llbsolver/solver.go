@@ -4,6 +4,7 @@ import (
 	"context"
 	"maps"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/solver/llbsolver/compat"
 	"github.com/moby/buildkit/solver/llbsolver/history"
+	"github.com/moby/buildkit/solver/llbsolver/mounts"
 	"github.com/moby/buildkit/solver/result"
 	spb "github.com/moby/buildkit/sourcepolicy/pb"
 	"github.com/moby/buildkit/util/compression"
@@ -46,6 +48,11 @@ type RemoteCacheExporter struct {
 	solver.CacheExportMode
 	IgnoreError bool
 	Compression compression.Config
+	// ExportMounts exports the contents of the cache mounts used by the build.
+	ExportMounts bool
+	// SkipLayers skips exporting the layer cache (mounts=only), so only cache
+	// mounts are exported.
+	SkipLayers bool
 }
 
 // ResolveWorkerFunc returns default worker for the temporary default non-distributed use cases
@@ -267,6 +274,14 @@ func (s *Solver) Solve(ctx context.Context, id string, sessionID string, req fro
 
 	j.SessionID = sessionID
 
+	mountTracker, err := s.cacheMountTracker(sessionID, req.CacheImports, exp.CacheExporters)
+	if err != nil {
+		return nil, err
+	}
+	if mountTracker != nil {
+		j.SetValue(mounts.JobKeyCacheMountHook, mounts.CacheMountHook(mountTracker))
+	}
+
 	br := s.bridge(j, withBridgeProxyNetwork(proxyNetwork || s.proxyNetwork))
 	defer br.releaseProvenanceRefs()
 	rootReq := req.Clone()
@@ -432,7 +447,7 @@ func (s *Solver) Solve(ctx context.Context, id string, sessionID string, req fro
 	var cacheExporterResponse map[string]string
 	eg.Go(func() error {
 		var err error
-		cacheExporterResponse, err = runCacheExporters(egCtx, cacheExporters, j, cached, inp)
+		cacheExporterResponse, err = runCacheExporters(egCtx, cacheExporters, j, cached, inp, mountTracker)
 		return err
 	})
 	if err := eg.Wait(); err != nil {
@@ -546,4 +561,24 @@ func notifyStarted(ctx context.Context, v *client.Vertex) func(err error) {
 		}
 		pw.Write(id, *v)
 	}
+}
+
+// cacheMountTracker returns the hook that imports and records cache mounts,
+// or nil if no cache import or export has mounts=true.
+func (s *Solver) cacheMountTracker(sessionID string, imports []frontend.CacheOptionsEntry, exporters []RemoteCacheExporter) (*cacheMountTracker, error) {
+	workers, err := s.workerController.List()
+	if err != nil {
+		return nil, err
+	}
+	t, err := newCacheMountTracker(workers, sessionID, imports, s.resolveCacheImporterFuncs)
+	if err != nil {
+		return nil, err
+	}
+	exportMounts := slices.ContainsFunc(exporters, func(e RemoteCacheExporter) bool {
+		return e.ExportMounts
+	})
+	if !exportMounts && len(t.sources) == 0 {
+		return nil, nil
+	}
+	return t, nil
 }

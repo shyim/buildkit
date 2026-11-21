@@ -61,6 +61,9 @@ type Config struct {
 	Repository string
 	Version    int
 	Timeout    time.Duration
+	// SkipLayers leaves the layer cache index untouched on export
+	// (mounts=only), so only cache mounts are exported.
+	SkipLayers bool
 
 	*signingconfig.Config
 	verifier signing.Verifier
@@ -119,6 +122,11 @@ func getConfig(conf *signingconfig.Config, v signing.VerifierProvider, attrs map
 		conf = &signingconfig.Config{}
 	}
 
+	mounts, err := remotecache.ParseMountsAttr(attrs)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Config{
 		Scope:      scope,
 		URL:        url,
@@ -127,6 +135,7 @@ func getConfig(conf *signingconfig.Config, v signing.VerifierProvider, attrs map
 		GHToken:    attrs[attrGHToken],
 		Repository: attrs[attrRepository],
 		Version:    apiVersionInt,
+		SkipLayers: !mounts.Layers(),
 		Config:     conf,
 		verifier:   signing.NewVerifier(conf.Verify.Policy, v),
 	}, nil
@@ -150,6 +159,9 @@ type exporter struct {
 	config     *Config
 	keyMapOnce sync.Once
 	keyMap     map[string]struct{}
+
+	mountsMu sync.Mutex
+	mounts   map[string]v1.DescriptorProviderPair
 }
 
 func NewExporter(c *Config) (remotecache.Exporter, error) {
@@ -259,6 +271,9 @@ func (ce *exporter) initActiveKeyMapOnce(ctx context.Context) (map[string]struct
 }
 
 func (ce *exporter) Finalize(ctx context.Context) (_ map[string]string, err error) {
+	if ce.config.SkipLayers {
+		return nil, ce.finalizeMounts(ctx)
+	}
 	// res := make(map[string]string)
 	config, descs, err := ce.chains.Marshal(ctx)
 	if err != nil {
@@ -323,6 +338,10 @@ func (ce *exporter) Finalize(ctx context.Context) (_ map[string]string, err erro
 	if err := ce.cache.SaveMutable(ctx, ce.indexKey(), 15*time.Second, func(old *actionscache.Entry) (actionscache.Blob, error) {
 		return actionscache.NewBlob(dt), nil
 	}); err != nil {
+		return nil, err
+	}
+
+	if err := ce.finalizeMounts(ctx); err != nil {
 		return nil, err
 	}
 

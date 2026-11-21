@@ -101,6 +101,14 @@ func (b *llbBridge) loadResult(ctx context.Context, def *pb.Definition, cacheImp
 	}
 	var cms []solver.CacheManager
 	for _, im := range cacheImports {
+		mounts, err := remotecache.ParseMountsAttr(im.Attrs)
+		if err != nil {
+			return nil, errors.Wrapf(err, "invalid %s cache import", im.Type)
+		}
+		if !mounts.Layers() {
+			// mounts=only imports are handled by the cache mount tracker.
+			continue
+		}
 		cmID, err := cmKey(im)
 		if err != nil {
 			return nil, err

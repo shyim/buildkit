@@ -74,6 +74,16 @@ func (g *cacheRefGetter) getRefCacheDir(ctx context.Context, ref cache.Immutable
 	mu.Lock()
 	defer mu.Unlock()
 
+	defer func() {
+		// Cache mounts with a from= source are keyed by a ref ID that only
+		// exists on this machine, so only plain cache mounts are reported.
+		if err == nil && ref == nil {
+			for _, h := range cacheMountHooks(ctx) {
+				h.CacheMountUsed(g.cm, key, mref.ID())
+			}
+		}
+	}()
+
 	if ref, ok := g.cacheMounts[key]; ok {
 		return ref.clone(ctx), nil
 	}
@@ -140,7 +150,20 @@ func (g *cacheRefGetter) getRefCacheDirNoCache(ctx context.Context, key string, 
 			break
 		}
 	}
-	mRef, err := makeMutable(ref)
+	parent := ref
+	if parent == nil {
+		if imported := importCacheMount(ctx, g.cm, id, g.session); imported != nil {
+			defer imported.Release(context.WithoutCancel(ctx))
+			parent = imported
+		}
+	}
+	mRef, err := makeMutable(parent)
+	if err != nil && parent != ref {
+		// The imported contents could not be applied, for example because
+		// the remote blob is gone. Start with an empty directory instead.
+		bklog.G(ctx).WithError(err).Warnf("failed to apply imported cache mount %q", id)
+		mRef, err = makeMutable(ref)
+	}
 	if err != nil {
 		return nil, err
 	}
